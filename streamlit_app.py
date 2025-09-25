@@ -8,7 +8,7 @@ import time
 # ---------------------- App meta ----------------------
 st.set_page_config(page_title="EVS Ops Assessment", layout="wide")
 st.title("EVS Inspection & Operational Assessment — Multi-Hospital")
-APP_VERSION = "v4.3.0"
+APP_VERSION = "v4.4.0"
 st.caption("Create Systems → Hospitals → Campuses, collect inspections by month, and roll up metrics by campus, hospital, or system.")
 PERIOD_PLACEHOLDER = "(create new)"
 
@@ -29,17 +29,17 @@ DEFAULT_RESPONSE_MAPS: Dict[str, Dict[str, float | None]] = {
 }
 
 # =============================================================
-# Photo helpers (for camera/upload features)
+# Photo helpers
 # =============================================================
 def _bytes_to_b64(data: bytes) -> str:
     return base64.b64encode(data).decode("utf-8")
 
-def _ensure_photos_container(campus: Dict, period: str) -> None:
-    ph = campus.setdefault("photos", {})
-    ph.setdefault(period, [])
+def _ensure_bci_item_photos(item: Dict, period: str) -> None:
+    photos = item.setdefault("photos", {})
+    photos.setdefault(period, [])
 
 def build_evs_template() -> Dict:
-    """Campus template with your sections, checklists, and photos storage."""
+    """Campus template with sections, checklists, and per-question photo storage."""
     bci_areas = {
         "Entrance and Lobby": [
             "Are entrance areas free of cigarette butts and litter?",
@@ -206,14 +206,13 @@ def build_evs_template() -> Dict:
             "bci": {
                 "areas": {
                     area: [
-                        {"name": q, "points": 1.0, "responses": {}, "comments": {}}
+                        {"name": q, "points": 1.0, "responses": {}, "comments": {}, "photos": {}}
                         for q in qs
                     ]
                     for area, qs in bci_areas.items()
                 }
             },
         },
-        "photos": {},  # NEW: maps period -> list of {b64, caption, ts}
     }
     return campus
 
@@ -396,6 +395,9 @@ def migrate_period_label(campus: Dict, old_label: str, new_label: str) -> None:
             if old_label in it["comments"]:
                 it["comments"].setdefault(new_label, it["comments"][old_label])
                 it["comments"].pop(old_label, None)
+            if "photos" in it and old_label in it["photos"]:
+                it["photos"].setdefault(new_label, it["photos"][old_label])
+                it["photos"].pop(old_label, None)
 
 # =============================================================
 # Sidebar — Hierarchy, Periods, Scoring Maps, Save/Load
@@ -553,7 +555,7 @@ with st.sidebar:
                         0.0, 1.0,
                         float(maps[section_key][k] or 0.0),
                         0.05,
-                        key=f"respmap_{section_key}_{k}_v430",
+                        key=f"respmap_{section_key}_{k}_v440",
                     )
 
     for key_name, label in [
@@ -563,7 +565,7 @@ with st.sidebar:
     ]:
         st.session_state.doc["weights"][key_name] = st.slider(
             label, 0.0, 1.0, float(st.session_state.doc["weights"][key_name]), 0.05,
-            key=f"weight_{key_name}_v430",
+            key=f"weight_{key_name}_v440",
         )
 
     st.divider()
@@ -594,11 +596,10 @@ tabs = st.tabs([
     "📊 Contractual & PIP",
     "🧭 System Standards",
     "🧹 BCI",
-    "📷 Photos & Evidence",   # NEW
     "📋 Campus Summary",
     "📊 Roll-Up Dashboard",
 ])
-TAB_OPINFO, TAB_PIP, TAB_SYS, TAB_BCI, TAB_PHOTOS, TAB_SUMMARY, TAB_ROLLUP = tabs
+TAB_OPINFO, TAB_PIP, TAB_SYS, TAB_BCI, TAB_SUMMARY, TAB_ROLLUP = tabs
 
 # ---------------------- Operational Info ----------------------
 with TAB_OPINFO:
@@ -670,7 +671,7 @@ with TAB_SYS:
     st.metric("Section Total", f"{s:.1f}")
     st.metric("% Compliant", f"{(s / d * 100 if d else 0):.1f}%")
 
-# ---------------------- BCI ----------------------
+# ---------------------- BCI (with per-question photos) ----------------------
 with TAB_BCI:
     st.subheader("Building Cleanliness Inspection")
     areas = CAMP["sections"]["bci"]["areas"]
@@ -707,103 +708,100 @@ with TAB_BCI:
                 it["responses"][current_period] = edited.iloc[i]["Response"]
                 it["comments"][current_period] = edited.iloc[i]["Comments"]
         st.success("Saved.")
+
+    # Attachments inline per question
+    st.markdown("### 📎 Attach evidence per BCI question (photos)")
+    for area, items in areas.items():
+        st.markdown(f"#### {area}")
+        for idx, it in enumerate(items):
+            _ensure_bci_item_photos(it, current_period)
+            colL, colR = st.columns([3, 4])
+
+            with colL:
+                st.write(f"**Q{idx+1}. {it['name']}**")
+                resp = it.get("responses", {}).get(current_period, "")
+                pts = it.get("points", 1.0)
+                cmt = it.get("comments", {}).get(current_period, "")
+                st.caption(f"Response: `{resp or '—'}` | Points: `{pts}`")
+                if cmt:
+                    st.caption(f"Comment: {cmt}")
+
+            with colR:
+                cam_key = f"bci_cam_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                snap = st.camera_input("Take photo", key=cam_key)
+                cap_cam_key = f"bci_cap_cam_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                cam_caption = st.text_input("Caption (camera)", key=cap_cam_key)
+
+                upl_key = f"bci_upl_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                uploads = st.file_uploader(
+                    "Upload images", type=["jpg","jpeg","png"], accept_multiple_files=True, key=upl_key
+                )
+                cap_upl_key = f"bci_cap_upl_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                upl_caption = st.text_input("Caption (uploads)", key=cap_upl_key)
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("💾 Save camera", key=f"bci_save_cam_{cam_key}") and snap is not None:
+                        try:
+                            it["photos"][current_period].append({
+                                "b64": _bytes_to_b64(snap.getvalue()),
+                                "caption": (cam_caption or "").strip(),
+                                "ts": time.time(),
+                            })
+                            st.success("Camera photo saved.")
+                        except Exception as e:
+                            st.error(f"Save failed: {e}")
+                with c2:
+                    if st.button("💾 Save uploads", key=f"bci_save_upl_{upl_key}") and uploads:
+                        saved = 0
+                        for up in uploads:
+                            try:
+                                it["photos"][current_period].append({
+                                    "b64": _bytes_to_b64(up.getvalue()),
+                                    "caption": (upl_caption or "").strip(),
+                                    "ts": time.time(),
+                                })
+                                saved += 1
+                            except Exception as e:
+                                st.error(f"Save failed for {getattr(up, 'name','file')}: {e}")
+                        if saved:
+                            st.success(f"Saved {saved} image(s).")
+
+                # Mini gallery for this question/period
+                gallery = it["photos"].get(current_period, [])
+                if gallery:
+                    st.caption("Evidence:")
+                    gallery_sorted = sorted(gallery, key=lambda x: x.get("ts", 0), reverse=True)
+                    rcols = st.columns(3)
+                    for gidx, ph in enumerate(gallery_sorted[:6]):  # show up to 6 to keep compact
+                        with rcols[gidx % 3]:
+                            try:
+                                st.image(base64.b64decode(ph["b64"]), use_container_width=True)
+                            except Exception:
+                                st.warning("Unable to display image.")
+                            edit_key = f"bci_cap_edit_{area}_{idx}_{gidx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                            new_cap = st.text_input("Caption", value=ph.get("caption",""), key=edit_key)
+                            e1, e2 = st.columns(2)
+                            with e2:
+                                if st.button("💾 Save", key=f"bci_cap_save_{edit_key}"):
+                                    for j, orig in enumerate(it["photos"][current_period]):
+                                        if orig.get("ts") == ph.get("ts"):
+                                            it["photos"][current_period][j]["caption"] = new_cap
+                                            st.success("Caption updated.")
+                                            break
+                            with e1:
+                                if st.button("🗑️ Delete", key=f"bci_cap_del_{edit_key}"):
+                                    it["photos"][current_period] = [
+                                        p for p in it["photos"][current_period] if p.get("ts") != ph.get("ts")
+                                    ]
+                                    st.success("Deleted.")
+                                    st.rerun()
+        st.divider()
+
     # Totals snapshot
     for area, items in areas.items():
         s, d = score_bci_area(items, current_period, st.session_state.doc["response_maps"]["bci"])
         st.caption(f"**{area}** — Section Total: {s:.1f}  |  % Compliant: {(s / d * 100 if d else 0):.1f}%")
-
-# ---------------------- Photos & Evidence ----------------------
-with TAB_PHOTOS:
-    st.subheader(f"Photos & Evidence — {current_sys} / {current_hosp} / {current_camp} / {current_period}")
-    _ensure_photos_container(CAMP, current_period)
-
-    with st.expander("Add photos", expanded=True):
-        c1, c2 = st.columns(2)
-
-        # Camera capture
-        with c1:
-            snap = st.camera_input("Take a photo")
-            snap_caption = st.text_input("Caption (for camera photo)", key=f"cap_cam_{current_sys}_{current_hosp}_{current_camp}_{current_period}")
-            if st.button("Save camera photo", key=f"save_cam_{current_sys}_{current_hosp}_{current_camp}_{current_period}") and snap is not None:
-                try:
-                    data = snap.getvalue()
-                    CAMP["photos"][current_period].append({
-                        "b64": _bytes_to_b64(data),
-                        "caption": snap_caption.strip(),
-                        "ts": time.time(),
-                    })
-                    st.success("Saved camera photo.")
-                except Exception as e:
-                    st.error(f"Save failed: {e}")
-
-        # File upload
-        with c2:
-            uploads = st.file_uploader(
-                "Upload images (JPEG/PNG)", type=["jpg", "jpeg", "png"], accept_multiple_files=True,
-                key=f"upl_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
-            )
-            upload_caption = st.text_input("Caption (applies to all uploads)", key=f"cap_upl_{current_sys}_{current_hosp}_{current_camp}_{current_period}")
-            if st.button("Save uploaded image(s)", key=f"save_upl_{current_sys}_{current_hosp}_{current_camp}_{current_period}") and uploads:
-                saved = 0
-                for up in uploads:
-                    try:
-                        data = up.getvalue()
-                        CAMP["photos"][current_period].append({
-                            "b64": _bytes_to_b64(data),
-                            "caption": upload_caption.strip(),
-                            "ts": time.time(),
-                        })
-                        saved += 1
-                    except Exception as e:
-                        st.error(f"Save failed for {getattr(up, 'name', 'file')}: {e}")
-                if saved:
-                    st.success(f"Saved {saved} image(s).")
-
-    st.divider()
-    st.markdown("### Gallery")
-    gallery = CAMP["photos"].get(current_period, [])
-
-    if not gallery:
-        st.info("No photos saved for this period yet.")
-    else:
-        # Sort newest first
-        gallery_sorted = sorted(gallery, key=lambda x: x.get("ts", 0), reverse=True)
-        per_row = 3
-        rows = (len(gallery_sorted) + per_row - 1) // per_row
-        for r in range(rows):
-            cols = st.columns(per_row)
-            for i in range(per_row):
-                idx = r * per_row + i
-                if idx >= len(gallery_sorted):
-                    break
-                item = gallery_sorted[idx]
-                with cols[i]:
-                    # display image
-                    try:
-                        st.image(base64.b64decode(item["b64"]), use_container_width=True)
-                    except Exception:
-                        st.warning("Unable to display image.")
-                    # caption editor
-                    cap_key = f"cap_edit_{current_sys}_{current_hosp}_{current_camp}_{current_period}_{idx}"
-                    new_cap = st.text_input("Caption", value=item.get("caption", ""), key=cap_key)
-                    # action buttons
-                    cdel, csave = st.columns(2)
-                    with csave:
-                        if st.button("💾 Save", key=f"save_cap_{cap_key}"):
-                            # find the real object in CAMP["photos"][current_period] and update its caption by timestamp match
-                            for j, orig in enumerate(CAMP["photos"][current_period]):
-                                if orig.get("ts") == item.get("ts"):
-                                    CAMP["photos"][current_period][j]["caption"] = new_cap
-                                    st.success("Updated caption.")
-                                    break
-                    with cdel:
-                        if st.button("🗑️ Delete", key=f"del_{cap_key}"):
-                            # delete by timestamp match
-                            CAMP["photos"][current_period] = [
-                                ph for ph in CAMP["photos"][current_period] if ph.get("ts") != item.get("ts")
-                            ]
-                            st.success("Deleted photo.")
-                            st.rerun()
 
 # ---------------------- Campus Summary ----------------------
 with TAB_SUMMARY:
@@ -990,4 +988,4 @@ with TAB_ROLLUP:
     else:
         st.info("Pick at least one period to render roll-ups.")
 
-st.caption("Add Systems → Hospitals → Campuses and months. Enter data per campus & month; then view Campus or aggregated Hospital/System dashboards. Export/import the whole file as JSON. | App " + APP_VERSION)
+st.caption("Add Systems → Hospitals → Campuses and months. Enter data per campus & month; add photo evidence per BCI question; then view Campus or aggregated Hospital/System dashboards. Export/import the whole file as JSON. | App " + APP_VERSION)
