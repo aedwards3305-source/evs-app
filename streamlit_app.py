@@ -8,8 +8,8 @@ import time
 # ---------------------- App meta ----------------------
 st.set_page_config(page_title="EVS Ops Assessment", layout="wide")
 st.title("EVS Inspection & Operational Assessment — Multi-Hospital")
-APP_VERSION = "v4.8.0"
-st.caption("Create Systems → Hospitals → Campuses, collect inspections by month, attach photos per BCI item (reactive bulk editor), and roll up metrics by campus, hospital, or system.")
+APP_VERSION = "v4.9.0"
+st.caption("Create Systems → Hospitals → Campuses, collect inspections by month, attach photos per BCI item (per-area save), and roll up metrics by campus, hospital, or system.")
 PERIOD_PLACEHOLDER = "(create new)"
 
 # =============================================================
@@ -548,7 +548,7 @@ with st.sidebar:
                         0.0, 1.0,
                         float(maps[section_key][k] or 0.0),
                         0.05,
-                        key=f"respmap_{section_key}_{k}_v480",
+                        key=f"respmap_{section_key}_{k}_v490",
                     )
 
     for key_name, label in [
@@ -558,7 +558,7 @@ with st.sidebar:
     ]:
         st.session_state.doc["weights"][key_name] = st.slider(
             label, 0.0, 1.0, float(st.session_state.doc["weights"][key_name]), 0.05,
-            key=f"weight_{key_name}_v480",
+            key=f"weight_{key_name}_v490",
         )
 
     st.divider()
@@ -677,7 +677,7 @@ with TAB_SYS:
     st.metric("Section Total", f"{s:.1f}")
     st.metric("% Compliant", f"{(s / d * 100 if d else 0):.1f}%")
 
-# ---------------------- BCI (Reactive bulk editor; instant camera) ----------------------
+# ---------------------- BCI (Per-area form + Save; stable, no blinking) ----------------------
 with TAB_BCI:
     st.subheader("Building Cleanliness Inspection")
     areas = CAMP["sections"]["bci"]["areas"]
@@ -685,169 +685,185 @@ with TAB_BCI:
     resp_options_with_blank = [""] + resp_options  # allow unset
 
     st.markdown("### 🧰 Bulk editor")
-    st.caption("Edit directly. Set **Action → Add evidence** on any row to open the camera/uploader for that item immediately.")
+    st.caption("Edit in the table below, then click **Save changes & open evidence** for that area. This prevents the camera panel from blinking while you type.")
+
+    # session state bucket for evidence panels to show: { area_name: [row_idx, ...], ... }
+    pending_key = f"bci_pending_capture_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+    if pending_key not in st.session_state:
+        st.session_state[pending_key] = {}
+
+    def _ensure_area_pending(area: str):
+        st.session_state[pending_key].setdefault(area, [])
+
+    def _remove_area_idx(area: str, idx: int):
+        _ensure_area_pending(area)
+        st.session_state[pending_key][area] = [i for i in st.session_state[pending_key][area] if i != idx]
+        if not st.session_state[pending_key][area]:
+            st.session_state[pending_key].pop(area, None)
 
     def _show_key(area_name: str, idx: int) -> str:
         return f"bci_show_ev_{area_name}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
 
-    open_panels: List[Tuple[str, int]] = []
-
     for area, items in areas.items():
         st.markdown(f"#### {area}")
 
-        df = pd.DataFrame([
-            {
-                "Q#": i + 1,
-                "Item": it["name"],
-                "Points": it.get("points", 1.0),
-                "Response": it.get("responses", {}).get(current_period, ""),
-                "Comments": it.get("comments", {}).get(current_period, ""),
-                "Action": "",  # "" or "Add evidence" (one-shot trigger)
-            }
-            for i, it in enumerate(items)
-        ])
+        # --- FORM: buffer edits until user hits Save ---
+        with st.form(key=f"bci_form_{area}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"):
+            df = pd.DataFrame([
+                {
+                    "Q#": i + 1,
+                    "Item": it["name"],
+                    "Points": it.get("points", 1.0),
+                    "Response": it.get("responses", {}).get(current_period, ""),
+                    "Comments": it.get("comments", {}).get(current_period, ""),
+                    "Action": "",  # "" or "Add evidence"
+                }
+                for i, it in enumerate(items)
+            ])
 
-        edited = st.data_editor(
-            df,
-            use_container_width=True,
-            num_rows="dynamic",
-            column_config={
-                "Q#": st.column_config.NumberColumn(help="Row id", disabled=True),
-                "Item": st.column_config.TextColumn(disabled=True),
-                "Points": st.column_config.NumberColumn(min_value=0.0, step=0.5),
-                "Response": st.column_config.SelectboxColumn(options=resp_options_with_blank),
-                "Comments": st.column_config.TextColumn(),
-                "Action": st.column_config.SelectboxColumn(options=["", "Add evidence"]),
-            },
-            key=f"bci_bulk_{area}_{current_sys}_{current_hosp}_{current_camp}_{current_period}",
-        )
+            edited = st.data_editor(
+                df,
+                use_container_width=True,
+                num_rows="dynamic",
+                column_config={
+                    "Q#": st.column_config.NumberColumn(help="Row id", disabled=True),
+                    "Item": st.column_config.TextColumn(disabled=True),
+                    "Points": st.column_config.NumberColumn(min_value=0.0, step=0.5),
+                    "Response": st.column_config.SelectboxColumn(options=resp_options_with_blank),
+                    "Comments": st.column_config.TextColumn(),
+                    "Action": st.column_config.SelectboxColumn(options=["", "Add evidence"]),
+                },
+                key=f"bci_bulk_{area}_{current_sys}_{current_hosp}_{current_camp}_{current_period}",
+            )
 
-        # Persist edits immediately & detect "Add evidence"
-        for _, row in edited.iterrows():
-            try:
-                i = int(row["Q#"]) - 1
-            except Exception:
-                continue
-            if i < 0 or i >= len(items):
-                continue
+            save_btn = st.form_submit_button("Save changes & open evidence", use_container_width=True)
 
-            it = items[i]
-            _ensure_bci_item_photos(it, current_period)
+        # --- APPLY SAVES ONLY WHEN BUTTON CLICKED ---
+        if save_btn:
+            to_open: List[int] = []
+            for _, row in edited.iterrows():
+                try:
+                    i = int(row["Q#"]) - 1
+                except Exception:
+                    continue
+                if i < 0 or i >= len(items):
+                    continue
 
-            pts_new = float(row.get("Points", it.get("points", 1.0)) or 1.0)
-            if pts_new != it.get("points", 1.0):
+                it = items[i]
+                _ensure_bci_item_photos(it, current_period)
+
+                # Save edits
+                pts_new = float(row.get("Points", it.get("points", 1.0)) or 1.0)
                 it["points"] = pts_new
 
-            resp_new = row.get("Response", "")
-            if it.get("responses", {}).get(current_period, "") != resp_new:
+                resp_new = row.get("Response", "")
                 it.setdefault("responses", {})[current_period] = resp_new
 
-            cmt_new = row.get("Comments", "")
-            if it.get("comments", {}).get(current_period, "") != cmt_new:
+                cmt_new = row.get("Comments", "")
                 it.setdefault("comments", {})[current_period] = cmt_new
 
-            if (row.get("Action") or "") == "Add evidence":
-                st.session_state[_show_key(area, i)] = True
-                open_panels.append((area, i))
+                # Queue evidence panel
+                if (row.get("Action") or "") == "Add evidence":
+                    to_open.append(i)
+                    st.session_state[_show_key(area, i)] = True  # remember panel "open"
 
-        st.divider()
+            if to_open:
+                _ensure_area_pending(area)
+                existing = set(st.session_state[pending_key].get(area, []))
+                st.session_state[pending_key][area] = sorted(existing.union(to_open))
+            st.success("Saved.")
+            st.rerun()
 
-    # Keep previously opened panels open
-    for area, items in areas.items():
-        for i, _ in enumerate(items):
-            if st.session_state.get(_show_key(area, i), False) and (area, i) not in open_panels:
-                open_panels.append((area, i))
+        # --- EVIDENCE PANELS FOR THIS AREA (stay stable while you type elsewhere) ---
+        sel_indices = st.session_state[pending_key].get(area, [])
+        if sel_indices:
+            st.markdown("##### 📸 Evidence capture")
+            for i in sel_indices:
+                if i < 0 or i >= len(items):
+                    continue
+                it = items[i]
+                _ensure_bci_item_photos(it, current_period)
+                gallery = it["photos"].get(current_period, [])
 
-    # ---------- Evidence capture panels ----------
-    if open_panels:
-        st.markdown("### 📸 Evidence capture")
-        for area, i in open_panels:
-            it = areas[area][i]
-            _ensure_bci_item_photos(it, current_period)
-            gallery = it["photos"].get(current_period, [])
+                st.markdown(f"**Q{i+1}. {it['name']}**")
+                col_cam, col_controls = st.columns([3, 2])
 
-            st.markdown(f"**{area} — Q{i+1}. {it['name']}**")
+                with col_cam:
+                    cam_key = f"bci_cam_{area}_{i}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                    snap = st.camera_input("Take photo", key=cam_key)
 
-            col_cam, col_controls = st.columns([3, 2])
-
-            with col_cam:
-                cam_key = f"bci_cam_{area}_{i}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
-                snap = st.camera_input("Take photo", key=cam_key)
-
-                if st.button("💾 Save camera photo", key=f"bci_save_cam_{cam_key}") and snap is not None:
-                    try:
-                        it["photos"][current_period].append({
-                            "b64": _bytes_to_b64(snap.getvalue()),
-                            "caption": (st.session_state.get(f"cap_cam_{cam_key}", "") or "").strip(),
-                            "ts": time.time(),
-                        })
-                        st.success("Camera photo saved.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Save failed: {e}")
-
-                upl_key = f"bci_upl_{area}_{i}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
-                uploads = st.file_uploader(
-                    "Upload images", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=upl_key
-                )
-                if st.button("💾 Save uploads", key=f"bci_save_upl_{upl_key}") and uploads:
-                    saved_cnt = 0
-                    for up in uploads:
+                    if st.button("💾 Save camera photo", key=f"bci_save_cam_{cam_key}") and snap is not None:
                         try:
                             it["photos"][current_period].append({
-                                "b64": _bytes_to_b64(up.getvalue()),
-                                "caption": (st.session_state.get(f"cap_upl_{upl_key}", "") or "").strip(),
+                                "b64": _bytes_to_b64(snap.getvalue()),
+                                "caption": (st.session_state.get(f"cap_cam_{cam_key}", "") or "").strip(),
                                 "ts": time.time(),
                             })
-                            saved_cnt += 1
+                            st.success("Camera photo saved.")
+                            st.rerun()
                         except Exception as e:
-                            st.error(f"Save failed for {getattr(up, 'name','file')}: {e}")
-                    if saved_cnt:
-                        st.success(f"Saved {saved_cnt} image(s).")
+                            st.error(f"Save failed: {e}")
+
+                    upl_key = f"bci_upl_{area}_{i}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                    uploads = st.file_uploader(
+                        "Upload images", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=upl_key
+                    )
+                    if st.button("💾 Save uploads", key=f"bci_save_upl_{upl_key}") and uploads:
+                        saved_cnt = 0
+                        for up in uploads:
+                            try:
+                                it["photos"][current_period].append({
+                                    "b64": _bytes_to_b64(up.getvalue()),
+                                    "caption": (st.session_state.get(f"cap_upl_{upl_key}", "") or "").strip(),
+                                    "ts": time.time(),
+                                })
+                                saved_cnt += 1
+                            except Exception as e:
+                                st.error(f"Save failed for {getattr(up, 'name','file')}: {e}")
+                        if saved_cnt:
+                            st.success(f"Saved {saved_cnt} image(s).")
+                            st.rerun()
+
+                with col_controls:
+                    st.text_input("Caption (camera)", key=f"cap_cam_{cam_key}")
+                    st.text_input("Caption (uploads)", key=f"cap_upl_{upl_key}")
+
+                    if st.button("✖️ Done with this item", key=f"bci_done_{area}_{i}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"):
+                        _remove_area_idx(area, i)
                         st.rerun()
 
-            with col_controls:
-                st.text_input("Caption (camera)", key=f"cap_cam_{cam_key}")
-                st.text_input("Caption (uploads)", key=f"cap_upl_{upl_key}")
+                # Mini-gallery with caption edit/delete
+                if gallery:
+                    st.caption("Evidence:")
+                    gallery_sorted = sorted(gallery, key=lambda x: x.get("ts", 0), reverse=True)
+                    gcols = st.columns(3)
+                    for gidx, ph in enumerate(gallery_sorted[:6]):  # show up to 6
+                        with gcols[gidx % 3]:
+                            try:
+                                st.image(base64.b64decode(ph["b64"]), use_container_width=True)
+                            except Exception:
+                                st.warning("Unable to display image.")
+                            edit_key = f"bci_cap_edit_{area}_{i}_{gidx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                            new_cap = st.text_input("Caption", value=ph.get("caption",""), key=edit_key)
+                            e1, e2 = st.columns(2)
+                            with e2:
+                                if st.button("💾 Save", key=f"bci_cap_save_{edit_key}"):
+                                    for j, orig in enumerate(it["photos"][current_period]):
+                                        if orig.get("ts") == ph.get("ts"):
+                                            it["photos"][current_period][j]["caption"] = new_cap
+                                            st.success("Caption updated.")
+                                            break
+                            with e1:
+                                if st.button("🗑️ Delete", key=f"bci_cap_del_{edit_key}"):
+                                    it["photos"][current_period] = [
+                                        p for p in it["photos"][current_period] if p.get("ts") != ph.get("ts")
+                                    ]
+                                    st.success("Deleted.")
+                                    st.rerun()
 
-                if st.button("✖️ Done with this item", key=f"bci_done_{area}_{i}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"):
-                    st.session_state[_show_key(area, i)] = False
-                    st.rerun()
+        st.markdown("---")
 
-            # Mini-gallery with caption edit/delete
-            if gallery:
-                st.caption("Evidence:")
-                gallery_sorted = sorted(gallery, key=lambda x: x.get("ts", 0), reverse=True)
-                gcols = st.columns(3)
-                for gidx, ph in enumerate(gallery_sorted[:6]):
-                    with gcols[gidx % 3]:
-                        try:
-                            st.image(base64.b64decode(ph["b64"]), use_container_width=True)
-                        except Exception:
-                            st.warning("Unable to display image.")
-                        edit_key = f"bci_cap_edit_{area}_{i}_{gidx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
-                        new_cap = st.text_input("Caption", value=ph.get("caption",""), key=edit_key)
-                        e1, e2 = st.columns(2)
-                        with e2:
-                            if st.button("💾 Save", key=f"bci_cap_save_{edit_key}"):
-                                for j, orig in enumerate(it["photos"][current_period]):
-                                    if orig.get("ts") == ph.get("ts"):
-                                        it["photos"][current_period][j]["caption"] = new_cap
-                                        st.success("Caption updated.")
-                                        break
-                        with e1:
-                            if st.button("🗑️ Delete", key=f"bci_cap_del_{edit_key}"):
-                                it["photos"][current_period] = [
-                                    p for p in it["photos"][current_period] if p.get("ts") != ph.get("ts")
-                                ]
-                                st.success("Deleted.")
-                                st.rerun()
-
-            st.markdown("---")
-    else:
-        st.info("Set **Action → Add evidence** on any row above to open the camera.")
-
-    # Totals snapshot per area
+    # ---- Totals snapshot per area ----
     for area, items in areas.items():
         s, d = score_bci_area(items, current_period, st.session_state.doc["response_maps"]["bci"])
         st.caption(f"**{area}** — Section Total: {s:.1f}  |  % Compliant: {(s / d * 100 if d else 0):.1f}%")
@@ -1038,7 +1054,7 @@ with TAB_ROLLUP:
         st.info("Pick at least one period to render roll-ups.")
 
 st.caption(
-    "Add Systems → Hospitals → Campuses and months. Use the reactive BCI bulk editor and choose Action → Add evidence to open the camera instantly. "
+    "Add Systems → Hospitals → Campuses and months. Use the per-area bulk editor, then Save to open evidence panels without blinking. "
     "Export/import the whole file as JSON. | App " + APP_VERSION
 )
 
