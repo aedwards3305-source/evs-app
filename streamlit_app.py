@@ -708,7 +708,7 @@ with TAB_BCI:
                 it.setdefault("comments", {})[current_period] = edited.iloc[i]["Comments"]
         st.success("Saved.")
 
-    st.markdown("### 🎯 Focused item (camera next to Comment)")
+    st.markdown("### 🎯 Focused item")
     st.caption("Pick an area and item to add/view photo evidence. Camera opens only when prompted.")
 
     # ------- Focused item selector -------
