@@ -8,8 +8,8 @@ import time
 # ---------------------- App meta ----------------------
 st.set_page_config(page_title="EVS Ops Assessment", layout="wide")
 st.title("EVS Inspection & Operational Assessment — Multi-Hospital")
-APP_VERSION = "v4.4.0"
-st.caption("Create Systems → Hospitals → Campuses, collect inspections by month, and roll up metrics by campus, hospital, or system.")
+APP_VERSION = "v4.5.0"
+st.caption("Create Systems → Hospitals → Campuses, collect inspections by month, attach photos per BCI item, and roll up metrics by campus, hospital, or system.")
 PERIOD_PLACEHOLDER = "(create new)"
 
 # =============================================================
@@ -555,7 +555,7 @@ with st.sidebar:
                         0.0, 1.0,
                         float(maps[section_key][k] or 0.0),
                         0.05,
-                        key=f"respmap_{section_key}_{k}_v440",
+                        key=f"respmap_{section_key}_{k}_v450",
                     )
 
     for key_name, label in [
@@ -565,7 +565,7 @@ with st.sidebar:
     ]:
         st.session_state.doc["weights"][key_name] = st.slider(
             label, 0.0, 1.0, float(st.session_state.doc["weights"][key_name]), 0.05,
-            key=f"weight_{key_name}_v440",
+            key=f"weight_{key_name}_v450",
         )
 
     st.divider()
@@ -671,11 +671,13 @@ with TAB_SYS:
     st.metric("Section Total", f"{s:.1f}")
     st.metric("% Compliant", f"{(s / d * 100 if d else 0):.1f}%")
 
-# ---------------------- BCI (with per-question photos) ----------------------
+# ---------------------- BCI (with per-question photos & on-demand camera) ----------------------
 with TAB_BCI:
     st.subheader("Building Cleanliness Inspection")
     areas = CAMP["sections"]["bci"]["areas"]
     options = list(st.session_state.doc["response_maps"]["bci"].keys())
+
+    # Data entry editor
     with st.form(key=f"form_bci_{current_sys}_{current_hosp}_{current_camp}_{current_period}"):
         edited_by_area = {}
         for area, items in areas.items():
@@ -709,7 +711,7 @@ with TAB_BCI:
                 it["comments"][current_period] = edited.iloc[i]["Comments"]
         st.success("Saved.")
 
-    # Attachments inline per question
+    # Attachments inline per question (camera shown only after clicking button)
     st.markdown("### 📎 Attach evidence per BCI question (photos)")
     for area, items in areas.items():
         st.markdown(f"#### {area}")
@@ -727,49 +729,72 @@ with TAB_BCI:
                     st.caption(f"Comment: {cmt}")
 
             with colR:
-                cam_key = f"bci_cam_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
-                snap = st.camera_input("Take photo", key=cam_key)
-                cap_cam_key = f"bci_cap_cam_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
-                cam_caption = st.text_input("Caption (camera)", key=cap_cam_key)
-
-                upl_key = f"bci_upl_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
-                uploads = st.file_uploader(
-                    "Upload images", type=["jpg","jpeg","png"], accept_multiple_files=True, key=upl_key
-                )
-                cap_upl_key = f"bci_cap_upl_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
-                upl_caption = st.text_input("Caption (uploads)", key=cap_upl_key)
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("💾 Save camera", key=f"bci_save_cam_{cam_key}") and snap is not None:
-                        try:
-                            it["photos"][current_period].append({
-                                "b64": _bytes_to_b64(snap.getvalue()),
-                                "caption": (cam_caption or "").strip(),
-                                "ts": time.time(),
-                            })
-                            st.success("Camera photo saved.")
-                        except Exception as e:
-                            st.error(f"Save failed: {e}")
-                with c2:
-                    if st.button("💾 Save uploads", key=f"bci_save_upl_{upl_key}") and uploads:
-                        saved = 0
-                        for up in uploads:
-                            try:
-                                it["photos"][current_period].append({
-                                    "b64": _bytes_to_b64(up.getvalue()),
-                                    "caption": (upl_caption or "").strip(),
-                                    "ts": time.time(),
-                                })
-                                saved += 1
-                            except Exception as e:
-                                st.error(f"Save failed for {getattr(up, 'name','file')}: {e}")
-                        if saved:
-                            st.success(f"Saved {saved} image(s).")
-
-                # Mini gallery for this question/period
                 gallery = it["photos"].get(current_period, [])
-                if gallery:
+                evidence_count = len(gallery)
+
+                # Per-item toggle to show/hide evidence input UI
+                show_key = f"bci_show_evidence_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                if show_key not in st.session_state:
+                    st.session_state[show_key] = False
+
+                if not st.session_state[show_key]:
+                    if st.button(f"📸 Add evidence ({evidence_count})", key=f"open_{show_key}"):
+                        st.session_state[show_key] = True
+                        st.rerun()
+                else:
+                    with st.container():
+                        st.markdown("**Add photo evidence**")
+
+                        cam_key = f"bci_cam_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                        snap = st.camera_input("Take photo", key=cam_key)
+                        cap_cam_key = f"bci_cap_cam_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                        cam_caption = st.text_input("Caption (camera)", key=cap_cam_key)
+
+                        upl_key = f"bci_upl_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                        uploads = st.file_uploader(
+                            "Upload images", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=upl_key
+                        )
+                        cap_upl_key = f"bci_cap_upl_{area}_{idx}_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+                        upl_caption = st.text_input("Caption (uploads)", key=cap_upl_key)
+
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            if st.button("💾 Save camera", key=f"bci_save_cam_{cam_key}") and snap is not None:
+                                try:
+                                    it["photos"][current_period].append({
+                                        "b64": _bytes_to_b64(snap.getvalue()),
+                                        "caption": (cam_caption or "").strip(),
+                                        "ts": time.time(),
+                                    })
+                                    st.success("Camera photo saved.")
+                                    st.session_state[show_key] = False
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Save failed: {e}")
+                        with c2:
+                            if st.button("💾 Save uploads", key=f"bci_save_upl_{upl_key}") and uploads:
+                                saved_cnt = 0
+                                for up in uploads:
+                                    try:
+                                        it["photos"][current_period].append({
+                                            "b64": _bytes_to_b64(up.getvalue()),
+                                            "caption": (upl_caption or "").strip(),
+                                            "ts": time.time(),
+                                        })
+                                        saved_cnt += 1
+                                    except Exception as e:
+                                        st.error(f"Save failed for {getattr(up, 'name','file')}: {e}")
+                                if saved_cnt:
+                                    st.success(f"Saved {saved_cnt} image(s).")
+                                    st.session_state[show_key] = False
+                                    st.rerun()
+                        with c3:
+                            if st.button("✖️ Close", key=f"close_{show_key}"):
+                                st.session_state[show_key] = False
+                                st.rerun()
+
+                # Mini gallery (always visible)
+                if evidence_count:
                     st.caption("Evidence:")
                     gallery_sorted = sorted(gallery, key=lambda x: x.get("ts", 0), reverse=True)
                     rcols = st.columns(3)
@@ -988,4 +1013,4 @@ with TAB_ROLLUP:
     else:
         st.info("Pick at least one period to render roll-ups.")
 
-st.caption("Add Systems → Hospitals → Campuses and months. Enter data per campus & month; add photo evidence per BCI question; then view Campus or aggregated Hospital/System dashboards. Export/import the whole file as JSON. | App " + APP_VERSION)
+st.caption("Add Systems → Hospitals → Campuses and months. Enter data per campus & month; attach photos per BCI question via the prompt; then view Campus or aggregated Hospital/System dashboards. Export/import the whole file as JSON. | App " + APP_VERSION)
