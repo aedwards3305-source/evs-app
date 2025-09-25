@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import json
 from typing import Dict, List, Tuple
+import base64
+import time
 
 # ---------------------- App meta ----------------------
 st.set_page_config(page_title="EVS Ops Assessment", layout="wide")
@@ -26,8 +28,18 @@ DEFAULT_RESPONSE_MAPS: Dict[str, Dict[str, float | None]] = {
     "bci": {"Pass": 1.0, "Partial": 0.5, "Fail": 0.0, "N/A": None},
 }
 
+# =============================================================
+# Photo helpers (for camera/upload features)
+# =============================================================
+def _bytes_to_b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("utf-8")
+
+def _ensure_photos_container(campus: Dict, period: str) -> None:
+    ph = campus.setdefault("photos", {})
+    ph.setdefault(period, [])
+
 def build_evs_template() -> Dict:
-    """Campus template with your sections and checklists."""
+    """Campus template with your sections, checklists, and photos storage."""
     bci_areas = {
         "Entrance and Lobby": [
             "Are entrance areas free of cigarette butts and litter?",
@@ -201,6 +213,7 @@ def build_evs_template() -> Dict:
                 }
             },
         },
+        "photos": {},  # NEW: maps period -> list of {b64, caption, ts}
     }
     return campus
 
@@ -581,10 +594,11 @@ tabs = st.tabs([
     "📊 Contractual & PIP",
     "🧭 System Standards",
     "🧹 BCI",
+    "📷 Photos & Evidence",   # NEW
     "📋 Campus Summary",
     "📊 Roll-Up Dashboard",
 ])
-TAB_OPINFO, TAB_PIP, TAB_SYS, TAB_BCI, TAB_SUMMARY, TAB_ROLLUP = tabs
+TAB_OPINFO, TAB_PIP, TAB_SYS, TAB_BCI, TAB_PHOTOS, TAB_SUMMARY, TAB_ROLLUP = tabs
 
 # ---------------------- Operational Info ----------------------
 with TAB_OPINFO:
@@ -697,6 +711,99 @@ with TAB_BCI:
     for area, items in areas.items():
         s, d = score_bci_area(items, current_period, st.session_state.doc["response_maps"]["bci"])
         st.caption(f"**{area}** — Section Total: {s:.1f}  |  % Compliant: {(s / d * 100 if d else 0):.1f}%")
+
+# ---------------------- Photos & Evidence ----------------------
+with TAB_PHOTOS:
+    st.subheader(f"Photos & Evidence — {current_sys} / {current_hosp} / {current_camp} / {current_period}")
+    _ensure_photos_container(CAMP, current_period)
+
+    with st.expander("Add photos", expanded=True):
+        c1, c2 = st.columns(2)
+
+        # Camera capture
+        with c1:
+            snap = st.camera_input("Take a photo")
+            snap_caption = st.text_input("Caption (for camera photo)", key=f"cap_cam_{current_sys}_{current_hosp}_{current_camp}_{current_period}")
+            if st.button("Save camera photo", key=f"save_cam_{current_sys}_{current_hosp}_{current_camp}_{current_period}") and snap is not None:
+                try:
+                    data = snap.getvalue()
+                    CAMP["photos"][current_period].append({
+                        "b64": _bytes_to_b64(data),
+                        "caption": snap_caption.strip(),
+                        "ts": time.time(),
+                    })
+                    st.success("Saved camera photo.")
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
+
+        # File upload
+        with c2:
+            uploads = st.file_uploader(
+                "Upload images (JPEG/PNG)", type=["jpg", "jpeg", "png"], accept_multiple_files=True,
+                key=f"upl_{current_sys}_{current_hosp}_{current_camp}_{current_period}"
+            )
+            upload_caption = st.text_input("Caption (applies to all uploads)", key=f"cap_upl_{current_sys}_{current_hosp}_{current_camp}_{current_period}")
+            if st.button("Save uploaded image(s)", key=f"save_upl_{current_sys}_{current_hosp}_{current_camp}_{current_period}") and uploads:
+                saved = 0
+                for up in uploads:
+                    try:
+                        data = up.getvalue()
+                        CAMP["photos"][current_period].append({
+                            "b64": _bytes_to_b64(data),
+                            "caption": upload_caption.strip(),
+                            "ts": time.time(),
+                        })
+                        saved += 1
+                    except Exception as e:
+                        st.error(f"Save failed for {getattr(up, 'name', 'file')}: {e}")
+                if saved:
+                    st.success(f"Saved {saved} image(s).")
+
+    st.divider()
+    st.markdown("### Gallery")
+    gallery = CAMP["photos"].get(current_period, [])
+
+    if not gallery:
+        st.info("No photos saved for this period yet.")
+    else:
+        # Sort newest first
+        gallery_sorted = sorted(gallery, key=lambda x: x.get("ts", 0), reverse=True)
+        per_row = 3
+        rows = (len(gallery_sorted) + per_row - 1) // per_row
+        for r in range(rows):
+            cols = st.columns(per_row)
+            for i in range(per_row):
+                idx = r * per_row + i
+                if idx >= len(gallery_sorted):
+                    break
+                item = gallery_sorted[idx]
+                with cols[i]:
+                    # display image
+                    try:
+                        st.image(base64.b64decode(item["b64"]), use_container_width=True)
+                    except Exception:
+                        st.warning("Unable to display image.")
+                    # caption editor
+                    cap_key = f"cap_edit_{current_sys}_{current_hosp}_{current_camp}_{current_period}_{idx}"
+                    new_cap = st.text_input("Caption", value=item.get("caption", ""), key=cap_key)
+                    # action buttons
+                    cdel, csave = st.columns(2)
+                    with csave:
+                        if st.button("💾 Save", key=f"save_cap_{cap_key}"):
+                            # find the real object in CAMP["photos"][current_period] and update its caption by timestamp match
+                            for j, orig in enumerate(CAMP["photos"][current_period]):
+                                if orig.get("ts") == item.get("ts"):
+                                    CAMP["photos"][current_period][j]["caption"] = new_cap
+                                    st.success("Updated caption.")
+                                    break
+                    with cdel:
+                        if st.button("🗑️ Delete", key=f"del_{cap_key}"):
+                            # delete by timestamp match
+                            CAMP["photos"][current_period] = [
+                                ph for ph in CAMP["photos"][current_period] if ph.get("ts") != item.get("ts")
+                            ]
+                            st.success("Deleted photo.")
+                            st.rerun()
 
 # ---------------------- Campus Summary ----------------------
 with TAB_SUMMARY:
