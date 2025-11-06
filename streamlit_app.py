@@ -1,6 +1,6 @@
 # EVS Ops Assessment — Multi-Hospital with PDF Export
 # Requirements:
-#   pip install streamlit reportlab pandas
+#   pip install streamlit reportlab pandas pillow
 
 import streamlit as st
 import pandas as pd
@@ -13,15 +13,21 @@ import io
 # -------- ReportLab imports (PDF) --------
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, PageBreak
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    Image as RLImage, PageBreak, KeepTogether
+)
 from reportlab.lib.enums import TA_LEFT
+
+# -------- Pillow for safe thumbnails in PDF (size/perf fix) --------
+from PIL import Image as PILImage
 
 # ---------------------- App meta ----------------------
 st.set_page_config(page_title="EVS Ops Assessment", layout="wide")
 st.title("EVS Inspection & Operational Assessment — Multi-Hospital")
-APP_VERSION = "v4.9.0"
+APP_VERSION = "v4.9.1-pdf-fix"
 st.caption("Create Systems → Hospitals → Campuses, collect inspections by month, attach photos per BCI item (per-area save), and roll up metrics by campus, hospital, or system.")
 PERIOD_PLACEHOLDER = "(create new)"
 
@@ -55,6 +61,24 @@ def _safe_str(v):
     if v is None:
         return ""
     return str(v)
+
+def _thumb_from_b64(b64: str, max_w_px: int = 1280) -> io.BytesIO:
+    """
+    PDF fix: downscale images to a sane width while preserving aspect ratio.
+    Keeps memory and file size in check, avoids PDF bloat and render errors.
+    Returns a BytesIO ready for RLImage.
+    """
+    raw = base64.b64decode(b64)
+    with PILImage.open(io.BytesIO(raw)) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        if w > max_w_px:
+            ratio = max_w_px / float(w)
+            im = im.resize((max_w_px, int(h * ratio)))
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=85, optimize=True, progressive=True)
+        out.seek(0)
+        return out
 
 # =============================================================
 # Template
@@ -419,21 +443,39 @@ def migrate_period_label(campus: Dict, old_label: str, new_label: str) -> None:
                 it["photos"].pop(old_label, None)
 
 # =============================================================
-# PDF Builder
+# PDF Builder (ROBUST FIX)
 # =============================================================
 def build_evs_pdf(campus: Dict, period: str, weights: Dict[str, float], maps: Dict[str, Dict]) -> bytes:
     """
     Build a multi-page PDF summarizing the selected campus & period.
-    Returns bytes suitable for st.download_button(..., mime='application/pdf').
+    PDF FIXES:
+      • Reliable wrapping for long text via Paragraph styles.
+      • Predictable page breaks via KeepTogether blocks.
+      • Downscaled thumbnails (Pillow) to avoid PDF bloat.
+      • UTF-8 safe (Paragraph) and stable image embedding.
     """
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=LETTER, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    doc = SimpleDocTemplate(
+        buf, pagesize=LETTER,
+        leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36
+    )
     styles = getSampleStyleSheet()
+    # Slightly tighter body/heading spacing for denser reports
     styles["Normal"].leading = 14
     title_style = styles["Title"]
     h_style = styles["Heading2"]
     h3_style = styles["Heading3"]
-    body = []
+
+    # Ensure normal paragraphs are left-aligned and wrap nicely
+    body_style = ParagraphStyle(
+        "BodyLeft",
+        parent=styles["Normal"],
+        alignment=TA_LEFT,
+        leading=14,
+        spaceAfter=4,
+    )
+
+    body: List = []
 
     meta = campus.get("meta", {})
     sys_name = _safe_str(meta.get("system", ""))
@@ -452,7 +494,7 @@ def build_evs_pdf(campus: Dict, period: str, weights: Dict[str, float], maps: Di
         ["Assessed By", assessed_by, "EVS Manager", evs_manager],
         ["Date", date_str, "", ""]
     ]
-    header_tbl = Table(header_tbl_data, colWidths=[1.1*inch, 2.4*inch, 1.2*inch, 2.25*inch])
+    header_tbl = Table(header_tbl_data, colWidths=[1.1*inch, 2.4*inch, 1.2*inch, 2.25*inch], repeatRows=0, hAlign="LEFT")
     header_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
         ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
@@ -464,8 +506,12 @@ def build_evs_pdf(campus: Dict, period: str, weights: Dict[str, float], maps: Di
     body.append(Spacer(1, 10))
 
     # ---------- Summary Metrics ----------
-    comp = compute_period_components(campus, period, maps)
-    summ = summarise_from_components(comp, weights)
+    comp = compute_period_components(campus, period, maps) if period else {"bci_by_dimension": {}, "bci_total": (0,0), "pip": (0,0), "sys": (0,0)}
+    summ = summarise_from_components(comp, weights) if period else {
+        "bci_by_dimension": {}, "bci_overall": 0.0,
+        "operational": {"financial_pip": 0.0, "system_standards": 0.0, "bci": 0.0, "weighted": 0.0}
+    }
+
     body.append(Paragraph("Operational Monthly Assessment", h_style))
     summary_tbl = Table([
         ["Category", "Percent"],
@@ -473,13 +519,14 @@ def build_evs_pdf(campus: Dict, period: str, weights: Dict[str, float], maps: Di
         ["System Standards (10%)", f"{summ['operational']['system_standards']:.1f}%"],
         ["Building Cleanliness Inspection (60%)", f"{summ['operational']['bci']:.1f}%"],
         ["Weighted % Compliant", f"{summ['operational']['weighted']:.1f}%"],
-    ], colWidths=[3.4*inch, 2.6*inch])
+    ], colWidths=[3.4*inch, 2.6*inch], repeatRows=1, hAlign="LEFT")
     summary_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
         ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
         ("INNERGRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
         ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
     ]))
     body.append(summary_tbl)
     body.append(Spacer(1, 12))
@@ -490,11 +537,11 @@ def build_evs_pdf(campus: Dict, period: str, weights: Dict[str, float], maps: Di
     op_tbl_data = [["KPI", "Value", "Comments"]]
     for r in op_rows:
         op_tbl_data.append([
-            _safe_str(r.get("name","")),
-            _safe_str(r.get("values",{}).get(period,"")),
-            _safe_str(r.get("comments",{}).get(period,"")),
+            Paragraph(_safe_str(r.get("name","")), body_style),
+            Paragraph(_safe_str(r.get("values",{}).get(period,"")), body_style),
+            Paragraph(_safe_str(r.get("comments",{}).get(period,"")), body_style),
         ])
-    op_tbl = Table(op_tbl_data, colWidths=[3.1*inch, 1.3*inch, 1.6*inch])
+    op_tbl = Table(op_tbl_data, colWidths=[3.1*inch, 1.3*inch, 1.6*inch], repeatRows=1, hAlign="LEFT")
     op_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
@@ -511,11 +558,11 @@ def build_evs_pdf(campus: Dict, period: str, weights: Dict[str, float], maps: Di
     pip_tbl_data = [["Question", "Response", "Comments"]]
     for r in pip_rows:
         pip_tbl_data.append([
-            _safe_str(r.get("name","")),
-            _safe_str(r.get("responses",{}).get(period,"")),
-            _safe_str(r.get("comments",{}).get(period,"")),
+            Paragraph(_safe_str(r.get("name","")), body_style),
+            Paragraph(_safe_str(r.get("responses",{}).get(period,"")), body_style),
+            Paragraph(_safe_str(r.get("comments",{}).get(period,"")), body_style),
         ])
-    pip_tbl = Table(pip_tbl_data, colWidths=[3.3*inch, 1.0*inch, 1.7*inch])
+    pip_tbl = Table(pip_tbl_data, colWidths=[3.3*inch, 1.0*inch, 1.7*inch], repeatRows=1, hAlign="LEFT")
     pip_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
@@ -532,11 +579,11 @@ def build_evs_pdf(campus: Dict, period: str, weights: Dict[str, float], maps: Di
     sys_tbl_data = [["Question", "Response", "Comments"]]
     for r in sys_rows:
         sys_tbl_data.append([
-            _safe_str(r.get("name","")),
-            _safe_str(r.get("responses",{}).get(period,"")),
-            _safe_str(r.get("comments",{}).get(period,"")),
+            Paragraph(_safe_str(r.get("name","")), body_style),
+            Paragraph(_safe_str(r.get("responses",{}).get(period,"")), body_style),
+            Paragraph(_safe_str(r.get("comments",{}).get(period,"")), body_style),
         ])
-    sys_tbl = Table(sys_tbl_data, colWidths=[3.3*inch, 1.0*inch, 1.7*inch])
+    sys_tbl = Table(sys_tbl_data, colWidths=[3.3*inch, 1.0*inch, 1.7*inch], repeatRows=1, hAlign="LEFT")
     sys_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
@@ -547,41 +594,46 @@ def build_evs_pdf(campus: Dict, period: str, weights: Dict[str, float], maps: Di
     body.append(sys_tbl)
     body.append(PageBreak())
 
-    # ---------- BCI (by area + optional thumbnails) ----------
+    # ---------- BCI (by area + thumbnails) ----------
     body.append(Paragraph("Building Cleanliness Inspection — Summary", h_style))
     dims = list(campus["sections"]["bci"]["areas"].keys())
     bci_rows = [["Area", "% Compliant"]]
     for d in dims:
-        d_s, d_d = comp["bci_by_dimension"][d]
+        d_s, d_d = comp["bci_by_dimension"].get(d, (0,0))
         pct = (d_s / d_d * 100) if d_d else 0.0
-        bci_rows.append([_safe_str(d), f"{pct:.1f}%"])
-    bci_rows.append(["Overall", f"{summ['bci_overall']:.1f}%"])
-    bci_tbl = Table(bci_rows, colWidths=[3.7*inch, 1.9*inch])
+        bci_rows.append([Paragraph(_safe_str(d), body_style), f"{pct:.1f}%"])
+    bci_rows.append([Paragraph("Overall", body_style), f"{summ['bci_overall']:.1f}%"])
+    bci_tbl = Table(bci_rows, colWidths=[3.7*inch, 1.9*inch], repeatRows=1, hAlign="LEFT")
     bci_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
         ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
         ("INNERGRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
     ]))
     body.append(bci_tbl)
     body.append(Spacer(1, 8))
 
-    # Evidence thumbnails (small, up to 4 per area)
+    # Evidence thumbnails (small, up to 4 per area) — wrapped in KeepTogether blocks
     for area in dims:
-        body.append(Paragraph(area, h3_style))
         items = campus["sections"]["bci"]["areas"][area]
         thumbs = []
+        # Collect up to 4 recent thumbs across items in area
         for it in items:
             gallery = it.get("photos", {}).get(period, [])
             for ph in sorted(gallery, key=lambda x: x.get("ts",0), reverse=True)[:2]:
+                # Safe thumbnail (bytes downscaled)
                 try:
-                    img_bytes = base64.b64decode(ph.get("b64",""))
-                    img = RLImage(io.BytesIO(img_bytes), width=1.6*inch, height=1.2*inch)
-                    thumbs.append(img)
+                    thumb_io = _thumb_from_b64(ph.get("b64",""), max_w_px=1280)
+                    # Render size: consistent small footprint; aspect preserved in downscale
+                    thumbs.append(RLImage(thumb_io, width=1.6*inch, height=1.2*inch))
                 except Exception:
                     pass
             if len(thumbs) >= 4:
                 break
+
+        block = []
+        block.append(Paragraph(area, h3_style))
         if thumbs:
             rows = []
             row = []
@@ -592,8 +644,9 @@ def build_evs_pdf(campus: Dict, period: str, weights: Dict[str, float], maps: Di
             if row: rows.append(row)
             img_tbl = Table(rows, hAlign="LEFT")
             img_tbl.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "MIDDLE")]))
-            body.append(img_tbl)
-        body.append(Spacer(1, 6))
+            block.append(img_tbl)
+        block.append(Spacer(1, 6))
+        body.append(KeepTogether(block))
 
     # ---------- Build PDF ----------
     doc.build(body)
