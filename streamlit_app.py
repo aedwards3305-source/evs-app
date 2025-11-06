@@ -1,9 +1,22 @@
+# EVS Ops Assessment — Multi-Hospital with PDF Export
+# Requirements:
+#   pip install streamlit reportlab pandas
+
 import streamlit as st
 import pandas as pd
 import json
 from typing import Dict, List, Tuple
 import base64
 import time
+import io
+
+# -------- ReportLab imports (PDF) --------
+from reportlab.lib.pagesizes import LETTER
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, PageBreak
+from reportlab.lib.enums import TA_LEFT
 
 # ---------------------- App meta ----------------------
 st.set_page_config(page_title="EVS Ops Assessment", layout="wide")
@@ -37,6 +50,11 @@ def _bytes_to_b64(data: bytes) -> str:
 def _ensure_bci_item_photos(item: Dict, period: str) -> None:
     photos = item.setdefault("photos", {})
     photos.setdefault(period, [])
+
+def _safe_str(v):
+    if v is None:
+        return ""
+    return str(v)
 
 # =============================================================
 # Template
@@ -401,6 +419,188 @@ def migrate_period_label(campus: Dict, old_label: str, new_label: str) -> None:
                 it["photos"].pop(old_label, None)
 
 # =============================================================
+# PDF Builder
+# =============================================================
+def build_evs_pdf(campus: Dict, period: str, weights: Dict[str, float], maps: Dict[str, Dict]) -> bytes:
+    """
+    Build a multi-page PDF summarizing the selected campus & period.
+    Returns bytes suitable for st.download_button(..., mime='application/pdf').
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=LETTER, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    styles["Normal"].leading = 14
+    title_style = styles["Title"]
+    h_style = styles["Heading2"]
+    h3_style = styles["Heading3"]
+    body = []
+
+    meta = campus.get("meta", {})
+    sys_name = _safe_str(meta.get("system", ""))
+    hosp_name = _safe_str(meta.get("hospital", ""))
+    camp_name = _safe_str(meta.get("campus", ""))
+    assessed_by = _safe_str(meta.get("assessed_by", ""))
+    evs_manager = _safe_str(meta.get("evs_manager", ""))
+    date_str = _safe_str(meta.get("date", ""))
+
+    # ---------- Title ----------
+    body.append(Paragraph("EVS Inspection & Operational Assessment", title_style))
+    body.append(Spacer(1, 6))
+    header_tbl_data = [
+        ["System", sys_name, "Hospital", hosp_name],
+        ["Campus", camp_name, "Period", _safe_str(period)],
+        ["Assessed By", assessed_by, "EVS Manager", evs_manager],
+        ["Date", date_str, "", ""]
+    ]
+    header_tbl = Table(header_tbl_data, colWidths=[1.1*inch, 2.4*inch, 1.2*inch, 2.25*inch])
+    header_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+    ]))
+    body.append(header_tbl)
+    body.append(Spacer(1, 10))
+
+    # ---------- Summary Metrics ----------
+    comp = compute_period_components(campus, period, maps)
+    summ = summarise_from_components(comp, weights)
+    body.append(Paragraph("Operational Monthly Assessment", h_style))
+    summary_tbl = Table([
+        ["Category", "Percent"],
+        ["Contractual & PIP (30%)", f"{summ['operational']['financial_pip']:.1f}%"],
+        ["System Standards (10%)", f"{summ['operational']['system_standards']:.1f}%"],
+        ["Building Cleanliness Inspection (60%)", f"{summ['operational']['bci']:.1f}%"],
+        ["Weighted % Compliant", f"{summ['operational']['weighted']:.1f}%"],
+    ], colWidths=[3.4*inch, 2.6*inch])
+    summary_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+    ]))
+    body.append(summary_tbl)
+    body.append(Spacer(1, 12))
+
+    # ---------- Operational Info ----------
+    body.append(Paragraph("Operational Information", h_style))
+    op_rows = campus["sections"]["operational_info"]
+    op_tbl_data = [["KPI", "Value", "Comments"]]
+    for r in op_rows:
+        op_tbl_data.append([
+            _safe_str(r.get("name","")),
+            _safe_str(r.get("values",{}).get(period,"")),
+            _safe_str(r.get("comments",{}).get(period,"")),
+        ])
+    op_tbl = Table(op_tbl_data, colWidths=[3.1*inch, 1.3*inch, 1.6*inch])
+    op_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+    ]))
+    body.append(op_tbl)
+    body.append(PageBreak())
+
+    # ---------- Contractual & PIP ----------
+    body.append(Paragraph("Contractual Financial & PIP", h_style))
+    pip_rows = campus["sections"]["contractual_pip"]
+    pip_tbl_data = [["Question", "Response", "Comments"]]
+    for r in pip_rows:
+        pip_tbl_data.append([
+            _safe_str(r.get("name","")),
+            _safe_str(r.get("responses",{}).get(period,"")),
+            _safe_str(r.get("comments",{}).get(period,"")),
+        ])
+    pip_tbl = Table(pip_tbl_data, colWidths=[3.3*inch, 1.0*inch, 1.7*inch])
+    pip_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+    ]))
+    body.append(pip_tbl)
+    body.append(Spacer(1, 12))
+
+    # ---------- System Standards ----------
+    body.append(Paragraph("System Standards", h_style))
+    sys_rows = campus["sections"]["system_standards"]
+    sys_tbl_data = [["Question", "Response", "Comments"]]
+    for r in sys_rows:
+        sys_tbl_data.append([
+            _safe_str(r.get("name","")),
+            _safe_str(r.get("responses",{}).get(period,"")),
+            _safe_str(r.get("comments",{}).get(period,"")),
+        ])
+    sys_tbl = Table(sys_tbl_data, colWidths=[3.3*inch, 1.0*inch, 1.7*inch])
+    sys_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+    ]))
+    body.append(sys_tbl)
+    body.append(PageBreak())
+
+    # ---------- BCI (by area + optional thumbnails) ----------
+    body.append(Paragraph("Building Cleanliness Inspection — Summary", h_style))
+    dims = list(campus["sections"]["bci"]["areas"].keys())
+    bci_rows = [["Area", "% Compliant"]]
+    for d in dims:
+        d_s, d_d = comp["bci_by_dimension"][d]
+        pct = (d_s / d_d * 100) if d_d else 0.0
+        bci_rows.append([_safe_str(d), f"{pct:.1f}%"])
+    bci_rows.append(["Overall", f"{summ['bci_overall']:.1f}%"])
+    bci_tbl = Table(bci_rows, colWidths=[3.7*inch, 1.9*inch])
+    bci_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+    ]))
+    body.append(bci_tbl)
+    body.append(Spacer(1, 8))
+
+    # Evidence thumbnails (small, up to 4 per area)
+    for area in dims:
+        body.append(Paragraph(area, h3_style))
+        items = campus["sections"]["bci"]["areas"][area]
+        thumbs = []
+        for it in items:
+            gallery = it.get("photos", {}).get(period, [])
+            for ph in sorted(gallery, key=lambda x: x.get("ts",0), reverse=True)[:2]:
+                try:
+                    img_bytes = base64.b64decode(ph.get("b64",""))
+                    img = RLImage(io.BytesIO(img_bytes), width=1.6*inch, height=1.2*inch)
+                    thumbs.append(img)
+                except Exception:
+                    pass
+            if len(thumbs) >= 4:
+                break
+        if thumbs:
+            rows = []
+            row = []
+            for i, t in enumerate(thumbs, 1):
+                row.append(t)
+                if i % 4 == 0:
+                    rows.append(row); row = []
+            if row: rows.append(row)
+            img_tbl = Table(rows, hAlign="LEFT")
+            img_tbl.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "MIDDLE")]))
+            body.append(img_tbl)
+        body.append(Spacer(1, 6))
+
+    # ---------- Build PDF ----------
+    doc.build(body)
+    buf.seek(0)
+    return buf.read()
+
+# =============================================================
 # Sidebar — Hierarchy, Periods, Scoring Maps, Save/Load
 # =============================================================
 with st.sidebar:
@@ -562,8 +762,10 @@ with st.sidebar:
         )
 
     st.divider()
+    # ---- JSON export/import ----
     doc_json = json.dumps(st.session_state.doc, indent=2).encode("utf-8")
     st.download_button("💾 Download Document (JSON)", doc_json, file_name="EVS_MultiHospital.json")
+
     up = st.file_uploader("Import Document (JSON)", type=["json"])
     if up:
         try:
@@ -575,6 +777,25 @@ with st.sidebar:
             st.rerun()
         except Exception as e:
             st.error(f"Load failed: {e}")
+
+    # ---- PDF export ----
+    try:
+        pdf_bytes = build_evs_pdf(
+            CAMP,
+            current_period if current_period != PERIOD_PLACEHOLDER else "",
+            st.session_state.doc["weights"],
+            st.session_state.doc["response_maps"],
+        )
+        default_pdf_name = f"EVS_{current_sys}_{current_hosp}_{current_camp}_{current_period}.pdf".replace(" ", "_")
+        st.download_button(
+            "📄 Download Adobe Report (PDF)",
+            data=pdf_bytes,
+            file_name=default_pdf_name,
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    except Exception as e:
+        st.error(f"PDF build failed: {e}")
 
 # Stop early if no real period selected
 if current_period == PERIOD_PLACEHOLDER:
@@ -1057,4 +1278,3 @@ st.caption(
     "Add Systems → Hospitals → Campuses and months. Use the per-area bulk editor, then Save to open evidence panels without blinking. "
     "Export/import the whole file as JSON. | App " + APP_VERSION
 )
-
